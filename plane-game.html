@@ -1,0 +1,559 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Airplane Game</title>
+<style>
+  :root{
+    --bg:#0b1220; --accent:#7fd1ff; --danger:#ff6b6b; --panel:rgba(255,255,255,0.06);
+  }
+  html,body{height:100%;margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial;}
+  .wrap{display:grid;place-items:center;height:100%;background:
+    radial-gradient(1200px 800px at 10% 10%, rgba(127,209,255,0.03), transparent),
+    linear-gradient(180deg,#07101a 0%, var(--bg) 100%);}
+  canvas{border-radius:14px; box-shadow: 0 10px 30px rgba(2,6,23,0.7);}
+  .ui{
+    position:fixed; left:16px; top:16px; color:#e6f7ff; background:var(--panel); padding:10px 14px; border-radius:10px;
+    backdrop-filter: blur(6px); font-size:13px;
+  }
+  .ui .big{font-weight:700; font-size:18px;}
+  .center-screen{
+    position:fixed; inset:0; display:flex; align-items:center; justify-content:center; pointer-events:none;
+  }
+  .menu{
+    pointer-events:auto; width:320px; background:linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.02)); padding:20px; border-radius:12px; color:#dff8ff;
+    box-shadow: 0 8px 30px rgba(0,0,0,0.6); text-align:center;
+  }
+  button{background:var(--accent); border:0; padding:10px 14px; border-radius:8px; font-weight:700; color:#032; cursor:pointer;}
+  .muted{opacity:0.8; font-size:13px;}
+  .footer{position:fixed; right:16px; top:16px; color:#bfefff; background:var(--panel); padding:8px 12px; border-radius:10px; font-size:13px;}
+  @media (max-width:520px){
+    canvas{width:92vw; height:55vh;}
+    .menu{width:90vw;}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <canvas id="game"></canvas>
+</div>
+
+<div class="ui" id="hud">
+  <div>Score: <span id="score">0</span></div>
+  <div class="muted">Lives: <span id="lives">3</span> • Fuel: <span id="fuel">100</span>%</div>
+</div>
+
+<div class="footer">
+  Controls: Move - WASD / Arrows / Drag • Shoot - Space / Tap
+</div>
+
+<div class="center-screen" id="menuWrap">
+  <div class="menu" id="menu">
+    <h2 style="margin:0 0 8px"✈️ Sky Runner</h2>
+    <p class="muted">Dodge obstacles, shoot enemies, collect fuel. Survive as long as you can.</p>
+    <div style="height:12px"></div>
+    <button id="startBtn">Start Game</button>
+    <div style="height:10px"></div>
+    <div class="muted" style="font-size:12px">Tip: Tap & hold on mobile to move the plane.</div>
+  </div>
+</div>
+
+<script>
+/* Airplane Game - single-file
+   Author: ChatGPT
+   Run: save as airplane-game.html and open in browser.
+*/
+
+// ----- Config -----
+const CONFIG = {
+  worldWidth: 800,   // logical canvas width
+  worldHeight: 600,  // logical canvas height
+  playerSpeed: 420,  // units per second
+  bulletSpeed: 820,
+  spawnInterval: 1100, // ms between obstacles
+  fuelDrainRate: 5, // fuel % per 10s -> per second handled in loop
+};
+
+// ----- Canvas setup -----
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d', { alpha: false });
+let DPR = Math.max(1, window.devicePixelRatio || 1);
+
+function resizeCanvasToDisplaySize() {
+  const rect = canvas.getBoundingClientRect();
+  // keep aspect ratio of logical world
+  const desiredRatio = CONFIG.worldWidth / CONFIG.worldHeight;
+  let w = Math.min(window.innerWidth - 40, 900);
+  let h = Math.round(w / desiredRatio);
+  if (window.innerWidth < 520) {
+    w = Math.round(window.innerWidth * 0.92);
+    h = Math.round((window.innerWidth * 0.92) / desiredRatio * 0.62);
+  }
+  canvas.style.width = w + "px";
+  canvas.style.height = h + "px";
+  canvas.width = Math.round(w * DPR);
+  canvas.height = Math.round(h * DPR);
+  ctx.setTransform(DPR * canvas.width / canvas.style.width.replace('px','') / DPR, 0, 0, DPR * canvas.height / canvas.style.height.replace('px','') / DPR, 0, 0);
+}
+window.addEventListener('resize', resizeCanvasToDisplaySize);
+resizeCanvasToDisplaySize();
+
+// ----- Game state -----
+let lastTime = performance.now();
+let accumulator = 0;
+let running = false;
+let score = 0;
+let lives = 3;
+let fuel = 100;
+let entities = [];
+let bullets = [];
+let stars = [];
+let enemyTimer = 0;
+let spawnInterval = CONFIG.spawnInterval;
+let keys = {};
+let pointer = { down:false, x:0, y:0, dragging:false };
+let player = {
+  x: CONFIG.worldWidth * 0.18,
+  y: CONFIG.worldHeight / 2,
+  w: 38,
+  h: 22,
+  vx: 0, vy: 0,
+  cooldown: 0
+};
+
+// HUD elements
+const scoreEl = document.getElementById('score');
+const livesEl = document.getElementById('lives');
+const fuelEl = document.getElementById('fuel');
+
+// ----- Utilities -----
+function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
+function rand(min,max){ return Math.random()*(max-min)+min; }
+function dist(a,b){ return Math.hypot(a.x-b.x, a.y-b.y); }
+
+// ----- Stars background -----
+for(let i=0;i<150;i++){
+  stars.push({x: rand(0, CONFIG.worldWidth), y: rand(0, CONFIG.worldHeight), s: rand(0.3,1.8), speed: rand(6,60)});
+}
+
+// ----- Entity factories -----
+function spawnObstacle(){
+  const h = rand(20, 80);
+  const y = rand(h/2, CONFIG.worldHeight - h/2);
+  const type = Math.random() < 0.75 ? 'rock' : 'drone';
+  const speed = rand(140, 280) + Math.min(0, -score*0.2);
+  if(type === 'rock'){
+    entities.push({
+      type:'rock', x: CONFIG.worldWidth + 60, y, w: rand(28,66), h, speed,
+      rot: rand(0,Math.PI*2), rotSpeed: rand(-0.8,0.8)
+    });
+  } else {
+    entities.push({
+      type:'drone', x: CONFIG.worldWidth + 60, y, w:44, h:28, speed, hp:2, shootTimer: rand(1400,3000)
+    });
+  }
+}
+
+function spawnFuel(){
+  const y = rand(40, CONFIG.worldHeight - 40);
+  entities.push({type:'fuel', x: CONFIG.worldWidth + 60, y, w:20, h:16, speed:160});
+}
+
+// ----- Controls -----
+window.addEventListener('keydown', e => {
+  keys[e.key.toLowerCase()] = true;
+  if(e.key === ' '){ e.preventDefault(); } // prevent page scroll on space
+});
+window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+
+canvas.addEventListener('pointerdown', e => {
+  pointer.down = true;
+  pointer.dragging = true;
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = CONFIG.worldWidth / rect.width;
+  const scaleY = CONFIG.worldHeight / rect.height;
+  pointer.x = (e.clientX - rect.left) * scaleX;
+  pointer.y = (e.clientY - rect.top) * scaleY;
+  // shoot on tap
+  shoot();
+});
+canvas.addEventListener('pointermove', e => {
+  if(!pointer.down) return;
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = CONFIG.worldWidth / rect.width;
+  const scaleY = CONFIG.worldHeight / rect.height;
+  pointer.x = (e.clientX - rect.left) * scaleX;
+  pointer.y = (e.clientY - rect.top) * scaleY;
+});
+canvas.addEventListener('pointerup', e => { pointer.down = false; pointer.dragging = false; });
+
+// ----- Game actions -----
+function shoot(){
+  if(player.cooldown > 0) return;
+  player.cooldown = 170; // ms
+  bullets.push({x: player.x + player.w*0.6, y: player.y, vx: CONFIG.bulletSpeed, r: 3});
+}
+
+function resetGame(){
+  score = 0; lives = 3; fuel = 100;
+  entities = []; bullets = []; enemyTimer = 0;
+  player.x = CONFIG.worldWidth * 0.18; player.y = CONFIG.worldHeight/2; player.cooldown = 0;
+  spawnInterval = CONFIG.spawnInterval;
+}
+
+// ----- Collision helpers -----
+function rectIntersect(a,b){
+  return !(a.x - a.w/2 > b.x + b.w/2 || a.x + a.w/2 < b.x - b.w/2 || a.y - a.h/2 > b.y + b.h/2 || a.y + a.h/2 < b.y - b.h/2);
+}
+
+// ----- Main update -----
+function update(dt){
+  if(!running) return;
+  // update background stars
+  for(let s of stars){
+    s.x -= s.speed * dt * 0.02;
+    if(s.x < -10) s.x = CONFIG.worldWidth + 10;
+  }
+
+  // player movement: keyboard
+  let mvx = 0, mvy = 0;
+  if(keys['arrowup'] || keys['w']) mvy = -1;
+  if(keys['arrowdown'] || keys['s']) mvy = 1;
+  if(keys['arrowleft'] || keys['a']) mvx = -1;
+  if(keys['arrowright'] || keys['d']) mvx = 1;
+
+  // pointer drag movement
+  if(pointer.dragging){
+    const dx = pointer.x - player.x;
+    const dy = pointer.y - player.y;
+    // ease towards pointer
+    player.vx = dx * 8;
+    player.vy = dy * 8;
+  } else {
+    player.vx = mvx * CONFIG.playerSpeed;
+    player.vy = mvy * CONFIG.playerSpeed;
+  }
+
+  // apply velocity
+  player.x += player.vx * dt;
+  player.y += player.vy * dt;
+  // clamp
+  player.x = clamp(player.x, player.w/2, CONFIG.worldWidth - player.w/2 - 40);
+  player.y = clamp(player.y, player.h/2, CONFIG.worldHeight - player.h/2);
+
+  // fuel drain
+  fuel -= CONFIG.fuelDrainRate * dt * 0.07; // slow drain, tuned for fun
+  fuel = Math.max(0, fuel);
+  if(fuel <= 0){
+    // slowly lose life if fuel depleted
+    if(Math.random() < dt*0.6){
+      lives -= 1;
+      fuel = 32; // emergency drop to avoid instant wipe
+    }
+  }
+
+  // bullets
+  for(let i=bullets.length-1;i>=0;i--){
+    const b = bullets[i];
+    b.x += b.vx * dt;
+    if(b.x > CONFIG.worldWidth + 20) bullets.splice(i,1);
+  }
+  if(player.cooldown > 0) player.cooldown -= dt*1000;
+
+  // spawn logic
+  enemyTimer += dt*1000;
+  if(enemyTimer >= spawnInterval){
+    enemyTimer = 0;
+    spawnObstacle();
+    if(Math.random() < 0.12) spawnFuel();
+    // increase difficulty slightly over time
+    spawnInterval = Math.max(520, spawnInterval - 8);
+  }
+
+  // entities update
+  for(let i=entities.length-1;i>=0;i--){
+    const e = entities[i];
+    e.x -= (e.speed || 160) * dt;
+    if(e.type === 'rock') {
+      e.rot += e.rotSpeed * dt;
+    } else if(e.type === 'drone'){
+      e.shootTimer -= dt*1000;
+      // drone shoots bullets toward the player
+      if(e.shootTimer <= 0){
+        e.shootTimer = rand(1400,3400);
+        const angle = Math.atan2(player.y - e.y, player.x - e.x);
+        bullets.push({x: e.x - 8, y: e.y + 0, vx: Math.cos(angle)*320, vy: Math.sin(angle)*320, r:4, enemy:true});
+      }
+      // simple AI vertical bob
+      e.y += Math.sin(performance.now() / 400 + i) * 12 * dt;
+    } else if(e.type === 'fuel'){
+      // gentle float
+      e.y += Math.sin(performance.now() / 700 + i) * 8 * dt;
+    }
+
+    // remove off-screen
+    if(e.x < -100) entities.splice(i,1);
+  }
+
+  // collisions: bullets vs entities
+  for(let bi=bullets.length-1; bi>=0; bi--){
+    const b = bullets[bi];
+    // bullet from player hits enemies (enemy bullets have enemy:true)
+    if(!b.enemy){
+      for(let ei=entities.length-1; ei>=0; ei--){
+        const e = entities[ei];
+        const hitBoxE = {x:e.x, y:e.y, w:e.w||30, h:e.h||30};
+        const hitBoxB = {x:b.x, y:b.y, w:b.r*2, h:b.r*2};
+        if(rectIntersect(hitBoxE, hitBoxB)){
+          // handle hit
+          if(e.type === 'rock'){
+            // rocks break with one hit, spawn debris (visual only)
+            entities.splice(ei,1);
+            score += 12;
+            bullets.splice(bi,1);
+            break;
+          } else if(e.type === 'drone'){
+            e.hp -= 1;
+            bullets.splice(bi,1);
+            if(e.hp <= 0){ entities.splice(ei,1); score += 30; }
+            break;
+          } else if(e.type === 'fuel'){
+            // bullets shouldn't break fuel
+            // do nothing
+          }
+        }
+      }
+    } else {
+      // enemy bullet hits player
+      const pb = {x:player.x, y:player.y, w:player.w, h:player.h};
+      const hb = {x:b.x, y:b.y, w:b.r*2, h:b.r*2};
+      if(rectIntersect(pb,hb)){
+        bullets.splice(bi,1);
+        lives -= 1;
+        score = Math.max(0, score - 20);
+      }
+    }
+  }
+
+  // entity vs player collisions
+  for(let i=entities.length-1;i>=0;i--){
+    const e = entities[i];
+    const hit = rectIntersect({x:player.x, y:player.y, w:player.w, h:player.h}, {x:e.x, y:e.y, w:e.w||30, h:e.h||30});
+    if(hit){
+      if(e.type === 'fuel'){
+        fuel = Math.min(100, fuel + 38);
+        entities.splice(i,1);
+        score += 18;
+      } else {
+        // collision with obstacle
+        lives -= 1;
+        entities.splice(i,1);
+      }
+    }
+  }
+
+  // death check
+  if(lives <= 0){
+    endGame();
+    return;
+  }
+
+  // score increments slowly over time
+  score += dt * 6;
+  // update HUD
+  scoreEl.textContent = Math.floor(score);
+  livesEl.textContent = Math.max(0, Math.floor(lives));
+  fuelEl.textContent = Math.floor(fuel);
+}
+
+// ----- Render -----
+function draw() {
+  // clear background
+  ctx.fillStyle = '#071023';
+  ctx.fillRect(0,0,CONFIG.worldWidth, CONFIG.worldHeight);
+
+  // map logical world -> canvas pixels
+  // scale to logical size
+  const sx = canvas.width / DPR / (canvas.style.width.replace('px','')/ (canvas.width / DPR)); // this hack avoids transform issues
+  // draw stars (use logical coords)
+  ctx.save();
+  ctx.scale(canvas.width / DPR / canvas.style.width.replace('px',''), canvas.height / DPR / canvas.style.height.replace('px',''));
+  // sky gradient
+  const g = ctx.createLinearGradient(0,0,0,CONFIG.worldHeight);
+  g.addColorStop(0,'#042231'); g.addColorStop(1,'#071023');
+  ctx.fillStyle = g;
+  ctx.fillRect(0,0,CONFIG.worldWidth, CONFIG.worldHeight);
+
+  // parallax stars
+  for(let s of stars){
+    ctx.globalAlpha = clamp(s.s * 0.9, 0.2, 1);
+    ctx.fillStyle = '#bfefff';
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, s.s, 0, Math.PI*2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // scrolling ground / clouds (subtle)
+  for(let i=0;i<6;i++){
+    const cx = (performance.now() * 0.02 * (i+1)) % (CONFIG.worldWidth + 400) - 200;
+    ctx.fillStyle = `rgba(255,255,255,${0.02 + i*0.01})`;
+    ctx.beginPath();
+    ctx.ellipse(cx, 120 + i*28, 120 + i*12, 26, 0, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  // entities
+  for(let e of entities){
+    if(e.type === 'rock'){
+      ctx.save();
+      ctx.translate(e.x, e.y);
+      ctx.rotate(e.rot);
+      ctx.fillStyle = '#7a6b55';
+      ctx.beginPath();
+      ctx.moveTo(-e.w/2, -e.h/2);
+      ctx.lineTo(e.w/2, -e.h/6);
+      ctx.lineTo(e.w/3, e.h/2);
+      ctx.lineTo(-e.w/3, e.h/3);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    } else if(e.type === 'drone'){
+      ctx.save();
+      ctx.translate(e.x, e.y);
+      // body
+      ctx.fillStyle = '#c5d8ff';
+      ctx.beginPath(); ctx.roundRect(-e.w/2, -e.h/2, e.w, e.h, 6); ctx.fill();
+      // propellers
+      ctx.fillStyle = '#90b4ff';
+      ctx.fillRect(-e.w/2 - 6, -8, 10, 4);
+      ctx.fillRect(-e.w/2 - 6, 4, 10, 4);
+      ctx.restore();
+    } else if(e.type === 'fuel'){
+      ctx.save();
+      ctx.translate(e.x, e.y);
+      ctx.fillStyle = '#ffef7d';
+      ctx.beginPath();
+      ctx.roundRect(-e.w/2, -e.h/2, e.w, e.h, 4);
+      ctx.fill();
+      ctx.fillStyle = '#9c7a00';
+      ctx.fillRect(-e.w/2 + 3, -2, e.w-6, 4);
+      ctx.restore();
+    }
+  }
+
+  // bullets
+  ctx.fillStyle = '#fff';
+  for(let b of bullets){
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, b.r, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  // player airplane (drawn as stylized triangle)
+  ctx.save();
+  ctx.translate(player.x, player.y);
+  // slight tilt based on vy
+  const tilt = clamp(player.vy / 900, -0.35, 0.35);
+  ctx.rotate(tilt);
+  // body
+  ctx.fillStyle = '#7fd1ff';
+  ctx.beginPath();
+  ctx.moveTo(-player.w/2, -player.h/2);
+  ctx.lineTo(player.w/2, 0);
+  ctx.lineTo(-player.w/2, player.h/2);
+  ctx.closePath();
+  ctx.fill();
+  // cockpit
+  ctx.fillStyle = '#032631';
+  ctx.beginPath();
+  ctx.ellipse(-4, 0, 8, 6, 0, 0, Math.PI*2);
+  ctx.fill();
+  // tail
+  ctx.fillStyle = '#5fb4dd';
+  ctx.fillRect(-player.w/2 - 4, -player.h/2 + 2, 6, player.h - 4);
+  ctx.restore();
+
+  // overlay gauges / UI drawn on canvas bottom right
+  ctx.fillStyle = 'rgba(0,0,0,0.08)';
+  ctx.fillRect(CONFIG.worldWidth - 160, CONFIG.worldHeight - 58, 150, 48);
+  ctx.fillStyle = '#dff8ff';
+  ctx.font = '14px system-ui,Arial';
+  ctx.fillText('Score: ' + Math.floor(score), CONFIG.worldWidth - 148, CONFIG.worldHeight - 34);
+  ctx.fillText('Lives: ' + Math.max(0, Math.floor(lives)), CONFIG.worldWidth - 148, CONFIG.worldHeight - 16);
+
+  ctx.restore();
+}
+
+// ----- Game loop -----
+function loop(now){
+  const dt = Math.min((now - lastTime) / 1000, 0.04);
+  lastTime = now;
+  update(dt);
+  draw();
+  if(running) requestAnimationFrame(loop);
+}
+
+// ----- Start / End game UI -----
+const menuWrap = document.getElementById('menuWrap');
+const startBtn = document.getElementById('startBtn');
+
+function startGame(){
+  resetGame();
+  running = true;
+  menuWrap.style.display = 'none';
+  lastTime = performance.now();
+  requestAnimationFrame(loop);
+}
+function endGame(){
+  running = false;
+  menuWrap.style.display = 'flex';
+  const menu = document.getElementById('menu');
+  menu.innerHTML = `
+    <h2 style="margin:0 0 6px">Game Over</h2>
+    <div style="font-size:18px; font-weight:700; margin-bottom:8px">${Math.floor(score)} pts</div>
+    <div class="muted">Thanks for playing — try again?</div>
+    <div style="height:12px"></div>
+    <button id="startBtn2">Restart</button>
+  `;
+  document.getElementById('startBtn2').addEventListener('click', () => {
+    menu.innerHTML = originalMenuHTML;
+    attachStart();
+    startGame();
+  });
+}
+
+const originalMenuHTML = document.getElementById('menu').innerHTML;
+function attachStart(){
+  document.getElementById('startBtn').addEventListener('click', startGame);
+}
+attachStart();
+
+// prevent canvas blurry on some browsers: keep logical drawing size constant
+(function init(){
+  // provide smooth roundRect if missing
+  if(!CanvasRenderingContext2D.prototype.roundRect){
+    CanvasRenderingContext2D.prototype.roundRect = function(x,y,w,h,r){
+      if(typeof r === 'number') r = {tl:r,tr:r,br:r,bl:r};
+      else r = r || {tl:0,tr:0,br:0,bl:0};
+      this.beginPath();
+      this.moveTo(x + r.tl, y);
+      this.lineTo(x + w - r.tr, y);
+      this.quadraticCurveTo(x + w, y, x + w, y + r.tr);
+      this.lineTo(x + w, y + h - r.br);
+      this.quadraticCurveTo(x + w, y + h, x + w - r.br, y + h);
+      this.lineTo(x + r.bl, y + h);
+      this.quadraticCurveTo(x, y + h, x, y + h - r.bl);
+      this.lineTo(x, y + r.tl);
+      this.quadraticCurveTo(x, y, x + r.tl, y);
+      this.closePath();
+      return this;
+    };
+  }
+  // initial resize
+  resizeCanvasToDisplaySize();
+})();
+</script>
+</body>
+</html>
